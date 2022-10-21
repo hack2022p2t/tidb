@@ -143,6 +143,9 @@ func recordGlobalMetaData(tctx *tcontext.Context, db *sql.Conn, buffer *bytes.Bu
 			writeMasterStatusHeader()
 			fmt.Fprintf(buffer, "\tLog: %s\n\tPos: %s\n\tGTID:%s\n", logFile, pos, gtidSet)
 		}
+	case version.ServerTypePostgreSQL:
+		// TODO
+		return nil
 	default:
 		return errors.Errorf("unsupported serverType %s for recordGlobalMetaData", serverType.String())
 	}

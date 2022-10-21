@@ -10,6 +10,7 @@ import (
 	"text/template"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/tidb/br/pkg/version"
 	tcontext "github.com/pingcap/tidb/dumpling/context"
 )
 
@@ -82,7 +83,7 @@ func ParseOutputFileTemplate(text string) (*template.Template, error) {
 }
 
 func prepareDumpingDatabases(tctx *tcontext.Context, conf *Config, db *sql.Conn) ([]string, error) {
-	databases, err := ShowDatabases(db)
+	databases, err := ShowDatabases(conf, db)
 	if err != nil {
 		return nil, err
 	}
@@ -93,6 +94,9 @@ func prepareDumpingDatabases(tctx *tcontext.Context, conf *Config, db *sql.Conn)
 	dbMap := make(map[string]interface{}, len(databases))
 	for _, database := range databases {
 		dbMap[database] = struct{}{}
+	}
+	if conf.ServerInfo.ServerType == version.ServerTypePostgreSQL {
+		return databases, nil
 	}
 	var notExistsDatabases []string
 	for _, database := range conf.Databases {

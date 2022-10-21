@@ -317,6 +317,8 @@ const (
 	ServerTypeMariaDB
 	// ServerTypeTiDB represents TiDB server type
 	ServerTypeTiDB
+	// ServerTypeTiDB represents TiDB server type
+	ServerTypePostgreSQL
 
 	// ServerTypeAll represents All server types
 	ServerTypeAll

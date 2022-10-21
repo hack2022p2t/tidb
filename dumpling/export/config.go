@@ -34,6 +34,7 @@ const (
 	flagUser                     = "user"
 	flagPort                     = "port"
 	flagPassword                 = "password"
+	flagSQLType                  = "sql-type"
 	flagAllowCleartextPasswords  = "allow-cleartext-passwords"
 	flagThreads                  = "threads"
 	flagFilesize                 = "filesize"
@@ -100,6 +101,7 @@ type Config struct {
 	Port     int
 	Threads  int
 	User     string
+	SQLType  string
 	Password string `json:"-"`
 	Security struct {
 		DriveTLSName string `json:"-"`
@@ -218,6 +220,13 @@ func (conf *Config) GetDSN(db string) string {
 	return dsn
 }
 
+// GetPostgreSQLDSN returns the PostgreSQL driver config from Config.
+func (conf *Config) GetPostgreSQLDSN(database string) string {
+	hostPort := net.JoinHostPort(conf.Host, strconv.Itoa(conf.Port))
+	dsn := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", conf.User, conf.Password, hostPort, database)
+	return dsn
+}
+
 func timestampDirName() string {
 	return fmt.Sprintf("./export-%s", time.Now().Format(time.RFC3339))
 }
@@ -231,6 +240,7 @@ func (*Config) DefineFlags(flags *pflag.FlagSet) {
 	flags.StringP(flagUser, "u", "root", "Username with privileges to run the dump")
 	flags.IntP(flagPort, "P", 4000, "TCP/IP port to connect to")
 	flags.StringP(flagPassword, "p", "", "User password")
+	flags.String(flagSQLType, "mysql", "Database type")
 	flags.Bool(flagAllowCleartextPasswords, false, "Allow passwords to be sent in cleartext (warning: don't use without TLS)")
 	flags.IntP(flagThreads, "t", 4, "Number of goroutines to use, default 4")
 	flags.StringP(flagFilesize, "F", "", "The approximate size of output file")
@@ -297,6 +307,10 @@ func (conf *Config) ParseFromFlags(flags *pflag.FlagSet) error {
 		return errors.Trace(err)
 	}
 	conf.Password, err = flags.GetString(flagPassword)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	conf.SQLType, err = flags.GetString(flagSQLType)
 	if err != nil {
 		return errors.Trace(err)
 	}

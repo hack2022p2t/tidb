@@ -38,12 +38,18 @@ const (
 	listTableByInfoSchema listTableType = iota
 	listTableByShowFullTables
 	listTableByShowTableStatus
+	listTableByInfoSchemaPostgreSQL
 )
 
 // ShowDatabases shows the databases of a database server.
-func ShowDatabases(db *sql.Conn) ([]string, error) {
+func ShowDatabases(conf *Config, db *sql.Conn) ([]string, error) {
 	var res oneStrColumnTable
-	if err := simpleQuery(db, "SHOW DATABASES", res.handleOneRow); err != nil {
+	sql := "SHOW DATABASES"
+	if conf.ServerInfo.ServerType == version.ServerTypePostgreSQL {
+		// sql = "SELECT datname FROM pg_database WHERE datistemplate = false"
+		sql = "SELECT schema_name FROM information_schema.schemata;"
+	}
+	if err := simpleQuery(db, sql, res.handleOneRow); err != nil {
 		return nil, err
 	}
 	return res.data, nil
@@ -60,7 +66,10 @@ func ShowTables(db *sql.Conn) ([]string, error) {
 
 // ShowCreateDatabase constructs the create database SQL for a specified database
 // returns (createDatabaseSQL, error)
-func ShowCreateDatabase(tctx *tcontext.Context, db *BaseConn, database string) (string, error) {
+func ShowCreateDatabase(tctx *tcontext.Context, conf *Config, db *BaseConn, database string) (string, error) {
+	if conf.ServerInfo.ServerType == version.ServerTypePostgreSQL {
+		return fmt.Sprintf("CREATE DATABASE `%s`", escapeString(database)), nil
+	}
 	var oneRow [2]string
 	handleOneRow := func(rows *sql.Rows) error {
 		return rows.Scan(&oneRow[0], &oneRow[1])
@@ -98,6 +107,54 @@ func ShowCreateTable(tctx *tcontext.Context, db *BaseConn, database, table strin
 		return "", err
 	}
 	return oneRow[1], nil
+}
+
+// ShowPostgresCreateTable constructs the create table SQL for a specified table for a postgres sql
+// returns (createTableSQL, error)
+func ShowPostgresCreateTable(tctx *tcontext.Context, db *BaseConn, database, table string) (string, error) {
+	query := fmt.Sprintf("SELECT column_name,data_type,character_maximum_length,is_nullable,generation_expression FROM information_schema.columns WHERE table_schema = '%s' AND table_name = '%s' ORDER BY ordinal_position", escapeString(database), escapeString(table))
+	results, err := db.QuerySQLWithColumns(tctx, []string{"column_name", "data_type", "character_maximum_length", "is_nullable", "generation_expression"}, query)
+	if err != nil {
+		return "", err
+	}
+	createTableSQL := fmt.Sprintf("CREATE TABLE `%s` (\n", escapeString(table))
+	for _, oneRow := range results {
+		columnName, dataType, characterMaximumLength, isNullable, generationExpression := oneRow[0], oneRow[1], oneRow[2], oneRow[3], oneRow[4]
+		if len(characterMaximumLength) > 0 {
+			characterMaximumLength = fmt.Sprintf("(%s)", characterMaximumLength)
+		}
+		dataType = strings.Trim(dataType, "\"")
+		nullableStr := ""
+		if isNullable != "YES" {
+			nullableStr = " NOT NULL"
+		}
+		if len(generationExpression) > 0 {
+			generationExpression = fmt.Sprintf(" GENERATED ALWAYS AS %s", generationExpression)
+		}
+		createTableSQL += fmt.Sprintf("  `%s` %s%s%s%s,\n", escapeString(columnName), dataType, characterMaximumLength, nullableStr, generationExpression)
+	}
+	query = fmt.Sprintf("SELECT indexname,indexdef FROM pg_indexes WHERE schemaname = '%s' AND tablename = '%s'", escapeString(database), escapeString(table))
+	results, err = db.QuerySQLWithColumns(tctx, []string{"indexname", "indexdef"}, query)
+	if err != nil {
+		return "", err
+	}
+	for _, oneRow := range results {
+		indexName, indexDef := oneRow[0], oneRow[1]
+		var indexType, indexFields string
+		if strings.Contains(indexName, "_pkey") {
+			indexType = "PRIMARY KEY"
+		} else if strings.Contains(indexDef, "UNIQUE INDEX") {
+			indexType = fmt.Sprintf("UNIQUE KEY `%s`", escapeString(indexName))
+		} else {
+			indexType = fmt.Sprintf("KEY `%s`", escapeString(indexName))
+		}
+		left, right := strings.IndexByte(indexDef, '('), strings.IndexByte(indexDef, ')')
+		indexFields = fmt.Sprintf(" (%s)", indexDef[left+1:right])
+		createTableSQL += fmt.Sprintf("  %s%s,\n", indexType, indexFields)
+	}
+	createTableSQL = strings.TrimSuffix(createTableSQL, ",\n")
+	createTableSQL += "\n)"
+	return createTableSQL, nil
 }
 
 // ShowCreatePlacementPolicy constructs the create policy SQL for a specified table
@@ -317,6 +374,30 @@ func ListAllDatabasesTables(tctx *tcontext.Context, db *sql.Conn, databaseNames 
 				return nil, errors.Annotatef(err, "sql: %s", query)
 			}
 		}
+	case listTableByInfoSchemaPostgreSQL:
+		query := "SELECT table_schema,table_name,table_type FROM information_schema.tables ORDER BY table_schema,table_name;"
+		for _, schema := range databaseNames {
+			dbTables[schema] = make([]*TableInfo, 0)
+		}
+		if err = simpleQueryWithArgs(tctx, db, func(rows *sql.Rows) error {
+			var (
+				err2 error
+			)
+			if err2 = rows.Scan(&schema, &table, &tableTypeStr); err != nil {
+				return errors.Trace(err2)
+			}
+			tableType, err2 = ParseTableType(tableTypeStr)
+			if err2 != nil {
+				return errors.Trace(err2)
+			}
+			// only append tables to schemas in databaseNames
+			if _, ok := dbTables[schema]; ok {
+				dbTables[schema] = append(dbTables[schema], &TableInfo{table, 0, tableType})
+			}
+			return nil
+		}, query); err != nil {
+			return nil, errors.Annotatef(err, "sql: %s", query)
+		}
 	default:
 		const queryTemplate = "SHOW TABLE STATUS FROM `%s`"
 		selectedTableType := make(map[TableType]struct{})
@@ -412,11 +493,10 @@ func buildSelectQuery(database, table, fields, partition, where, orderByClause s
 		fields = "''"
 	}
 	query.WriteString(fields)
-	query.WriteString(" FROM `")
+	query.WriteString(" FROM ")
 	query.WriteString(escapeString(database))
-	query.WriteString("`.`")
+	query.WriteString(".")
 	query.WriteString(escapeString(table))
-	query.WriteByte('`')
 	if partition != "" {
 		query.WriteString(" PARTITION(`")
 		query.WriteString(escapeString(partition))
@@ -448,6 +528,26 @@ func buildOrderByClause(tctx *tcontext.Context, conf *Config, db *BaseConn, data
 		return "", errors.Trace(err)
 	}
 	return buildOrderByClauseString(cols), nil
+}
+
+func buildPostgresOrderByClause(tctx *tcontext.Context, conf *Config, db *BaseConn, database, table string) (string, error) { // revive:disable-line:flag-parameter
+	if !conf.SortByPk {
+		return "", nil
+	}
+	query := fmt.Sprintf("SELECT indexname,indexdef FROM pg_indexes WHERE schemaname = '%s' AND tablename = '%s'", escapeString(database), escapeString(table))
+	results, err := db.QuerySQLWithColumns(tctx, []string{"indexname,indexdef"}, query)
+	if err != nil {
+		return "", err
+	}
+	for _, oneRow := range results {
+		indexName, indexDef := oneRow[0], oneRow[1]
+		if !strings.Contains(indexName, "_pkey") {
+			continue
+		}
+		left, right := strings.IndexByte(indexDef, '('), strings.IndexByte(indexDef, ')')
+		return indexDef[left+1 : right], nil
+	}
+	return "", nil
 }
 
 // SelectTiDBRowID checks whether this table has _tidb_rowid column
@@ -488,7 +588,7 @@ func GetSuitableRows(avgRowLength uint64) uint64 {
 
 // GetColumnTypes gets *sql.ColumnTypes from a specified table
 func GetColumnTypes(tctx *tcontext.Context, db *BaseConn, fields, database, table string) ([]*sql.ColumnType, error) {
-	query := fmt.Sprintf("SELECT %s FROM `%s`.`%s` LIMIT 1", fields, escapeString(database), escapeString(table))
+	query := fmt.Sprintf("SELECT %s FROM %s.%s LIMIT 1", fields, escapeString(database), escapeString(table))
 	var colTypes []*sql.ColumnType
 	err := db.QuerySQL(tctx, func(rows *sql.Rows) error {
 		var err error
@@ -608,6 +708,41 @@ func getNumericIndex(tctx *tcontext.Context, db *BaseConn, meta TableMeta) (stri
 			}
 		}
 		return uniqueKeyColumn, nil
+	}
+	return keyColumn, nil
+}
+
+// getNumericIndex picks up indices according to the following priority:
+// primary key > unique key with the smallest count > key with the max cardinality
+// primary key with multi cols is before unique key with single col because we will sort result by primary keys
+func getPostgresNumericIndex(tctx *tcontext.Context, db *BaseConn, meta TableMeta) (string, error) {
+	database, table := meta.DatabaseName(), meta.TableName()
+	colName2Type := string2Map(meta.ColumnNames(), meta.ColumnTypes())
+	keyQuery := fmt.Sprintf("SELECT indexname,indexdef FROM pg_indexes WHERE schemaname = '%s' AND tablename = '%s'", escapeString(database), escapeString(table))
+	results, err := db.QuerySQLWithColumns(tctx, []string{"indexname", "indexdef"}, keyQuery)
+	if err != nil {
+		return "", err
+	}
+	var keyColumn string
+	for _, oneRow := range results {
+		indexName, indexDef := oneRow[0], oneRow[1]
+		if !strings.Contains(indexDef, "UNIQUE INDEX") {
+			continue
+		}
+		left, right := strings.IndexByte(indexDef, '('), strings.IndexByte(indexDef, ')')
+		colsSeq := indexDef[left+1 : right]
+		cols := strings.Split(colsSeq, ",")
+		if len(cols) == 0 {
+			continue
+		}
+		colName := strings.TrimSpace(cols[0])
+		_, numberColumn := dataTypeInt[colName2Type[colName]]
+		if numberColumn {
+			if strings.Contains(indexName, "_pkey") {
+				return colName, nil
+			}
+			keyColumn = colName
+		}
 	}
 	return keyColumn, nil
 }
@@ -939,6 +1074,31 @@ func buildSelectField(tctx *tcontext.Context, db *BaseConn, dbName, tableName st
 	return "*", len(availableFields), nil
 }
 
+// buildPostgresSelectField returns the selecting fields' string(joined by comma(`,`)),
+// and the number of writable fields.
+func buildPostgresSelectField(tctx *tcontext.Context, db *BaseConn, dbName, tableName string, completeInsert bool) (string, int, error) { // revive:disable-line:flag-parameter
+	query := fmt.Sprintf("SELECT column_name,is_generated FROM information_schema.columns WHERE table_schema = '%s' AND table_name = '%s' ORDER BY ordinal_position", escapeString(dbName), escapeString(tableName))
+	results, err := db.QuerySQLWithColumns(tctx, []string{"COLUMN_NAME", "IS_GENERATED"}, query)
+	if err != nil {
+		return "", 0, err
+	}
+	availableFields := make([]string, 0)
+	hasGenerateColumn := false
+	for _, oneRow := range results {
+		fieldName, extra := oneRow[0], oneRow[1]
+		switch extra {
+		case "ALWAYS":
+			hasGenerateColumn = true
+			continue
+		}
+		availableFields = append(availableFields, escapeString(fieldName))
+	}
+	if completeInsert || hasGenerateColumn {
+		return strings.Join(availableFields, ","), len(availableFields), nil
+	}
+	return "*", len(availableFields), nil
+}
+
 func buildWhereClauses(handleColNames []string, handleVals [][]string) []string {
 	if len(handleColNames) == 0 || len(handleVals) == 0 {
 		return nil
@@ -1152,13 +1312,21 @@ func simpleQueryWithArgs(ctx context.Context, conn *sql.Conn, handleOneRow func(
 	return errors.Annotatef(rows.Err(), "sql: %s, args: %s", query, args)
 }
 
-func pickupPossibleField(tctx *tcontext.Context, meta TableMeta, db *BaseConn) (string, error) {
+func pickupPossibleField(tctx *tcontext.Context, conf *Config, meta TableMeta, db *BaseConn) (string, error) {
 	// try using _tidb_rowid first
 	if meta.HasImplicitRowID() {
 		return "_tidb_rowid", nil
 	}
-	// try to use pk or uk
-	fieldName, err := getNumericIndex(tctx, db, meta)
+	var (
+		fieldName string
+		err       error
+	)
+	if conf.ServerInfo.ServerType == version.ServerTypePostgreSQL {
+		fieldName, err = getPostgresNumericIndex(tctx, db, meta)
+	} else {
+		// try to use pk or uk
+		fieldName, err = getNumericIndex(tctx, db, meta)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -1167,7 +1335,60 @@ func pickupPossibleField(tctx *tcontext.Context, meta TableMeta, db *BaseConn) (
 	return fieldName, nil
 }
 
+func estimateCountPostgreSQL(tctx *tcontext.Context, dbName, tableName string, db *BaseConn, field string, conf *Config) uint64 {
+	query := fmt.Sprintf("EXPLAIN SELECT %s FROM %s.%s;", field, escapeString(dbName), escapeString(tableName))
+	var (
+		oneRow     []sql.NullString
+		estRowsStr string
+	)
+
+	err := db.QuerySQL(tctx, func(rows *sql.Rows) error {
+		columns, err := rows.Columns()
+		if err != nil {
+			return errors.Trace(err)
+		}
+		addr := make([]interface{}, len(columns))
+		oneRow = make([]sql.NullString, len(columns))
+
+		for i := range oneRow {
+			addr[i] = &oneRow[i]
+		}
+		err = rows.Scan(addr...)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		for _, rowStr := range oneRow {
+			if rowStr.Valid {
+				fields := strings.Fields(rowStr.String)
+				for _, f := range fields {
+					if strings.HasPrefix(f, "rows=") {
+						estRowsStr = strings.TrimPrefix(f, "rows=")
+						return nil
+					}
+				}
+			}
+		}
+		return nil
+	}, func() {}, query)
+	if err != nil || len(estRowsStr) == 0 {
+		tctx.L().Info("can't estimate rows from db",
+			zap.String("query", query), zap.String("estRowsStr", estRowsStr), log.ShortError(err))
+		return 0
+	}
+
+	estRows, err := strconv.ParseFloat(estRowsStr, 64)
+	if err != nil {
+		tctx.L().Info("can't get parse estimate rows from db",
+			zap.String("query", query), zap.String("estRowsStr", estRowsStr), log.ShortError(err))
+		return 0
+	}
+	return uint64(estRows)
+}
+
 func estimateCount(tctx *tcontext.Context, dbName, tableName string, db *BaseConn, field string, conf *Config) uint64 {
+	if conf.ServerInfo.ServerType == version.ServerTypePostgreSQL {
+		return estimateCountPostgreSQL(tctx, dbName, tableName, db, field, conf)
+	}
 	var query string
 	if strings.TrimSpace(field) == "*" || strings.TrimSpace(field) == "" {
 		query = fmt.Sprintf("EXPLAIN SELECT * FROM `%s`.`%s`", escapeString(dbName), escapeString(tableName))
