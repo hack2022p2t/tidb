@@ -32,13 +32,13 @@ func initColTypeRowReceiverMap() {
 
 	dataTypeIntArr := []string{
 		"INTEGER", "BIGINT", "TINYINT", "SMALLINT", "MEDIUMINT",
-		"INT", "INT1", "INT2", "INT3", "INT8",
+		"INT", "INT1", "INT2", "INT3", "INT2VECTOR", "INT4", "INT8",
 	}
 
 	dataTypeNumArr := append(dataTypeIntArr, []string{
 		"FLOAT", "REAL", "DOUBLE", "DOUBLE PRECISION",
 		"DECIMAL", "NUMERIC", "FIXED",
-		"BOOL", "BOOLEAN",
+		"BOOL", "BOOLEAN", "FLOAT4", "FLOAT8",
 	}...)
 
 	dataTypeBinArr := []string{

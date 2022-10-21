@@ -17,6 +17,7 @@ import (
 
 	// import mysql driver
 	"github.com/go-sql-driver/mysql"
+	_ "github.com/lib/pq"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	pclog "github.com/pingcap/log"
@@ -388,7 +389,7 @@ func (d *Dumper) dumpDatabases(tctx *tcontext.Context, metaConn *BaseConn, taskC
 	parser1 := parser.New()
 	for dbName, tables := range allTables {
 		if !conf.NoSchemas {
-			createDatabaseSQL, err := ShowCreateDatabase(tctx, metaConn, dbName)
+			createDatabaseSQL, err := ShowCreateDatabase(tctx, conf, metaConn, dbName)
 			if err != nil {
 				return errors.Trace(err)
 			}
@@ -587,9 +588,16 @@ func (d *Dumper) dumpTableData(tctx *tcontext.Context, conn *BaseConn, meta Tabl
 	}
 
 	// Update total rows
-	fieldName, _ := pickupPossibleField(tctx, meta, conn)
-	c := estimateCount(tctx, meta.DatabaseName(), meta.TableName(), conn, fieldName, conf)
-	AddCounter(d.metrics.estimateTotalRowsCounter, float64(c))
+	var (
+		fieldName string
+		c         uint64
+	)
+
+	if conf.ServerInfo.ServerType != version.ServerTypePostgreSQL {
+		fieldName, _ = pickupPossibleField(tctx, conf, meta, conn)
+		c = estimateCount(tctx, meta.DatabaseName(), meta.TableName(), conn, fieldName, conf)
+		AddCounter(d.metrics.estimateTotalRowsCounter, float64(c))
+	}
 
 	if conf.Rows == UnspecifiedSize {
 		return d.sequentialDumpTable(tctx, conn, meta, taskChan)
@@ -688,7 +696,16 @@ func (d *Dumper) sequentialDumpTable(tctx *tcontext.Context, conn *BaseConn, met
 			zap.String("database", meta.DatabaseName()),
 			zap.String("table", meta.TableName()))
 	}
-	orderByClause, err := buildOrderByClause(tctx, conf, conn, meta.DatabaseName(), meta.TableName(), meta.HasImplicitRowID())
+	var (
+		orderByClause string
+		err           error
+	)
+
+	if conf.ServerInfo.ServerType == version.ServerTypePostgreSQL {
+		orderByClause, err = buildPostgresOrderByClause(tctx, conf, conn, meta.DatabaseName(), meta.TableName())
+	} else {
+		orderByClause, err = buildOrderByClause(tctx, conf, conn, meta.DatabaseName(), meta.TableName(), meta.HasImplicitRowID())
+	}
 	if err != nil {
 		return err
 	}
@@ -713,12 +730,17 @@ func (d *Dumper) concurrentDumpTable(tctx *tcontext.Context, conn *BaseConn, met
 		}
 	}
 
-	orderByClause, err := buildOrderByClause(tctx, conf, conn, db, tbl, meta.HasImplicitRowID())
-	if err != nil {
-		return err
+	var (
+		orderByClause string
+		err           error
+	)
+	if conf.ServerInfo.ServerType == version.ServerTypePostgreSQL {
+		orderByClause, err = buildPostgresOrderByClause(tctx, conf, conn, meta.DatabaseName(), meta.TableName())
+	} else {
+		orderByClause, err = buildOrderByClause(tctx, conf, conn, meta.DatabaseName(), meta.TableName(), meta.HasImplicitRowID())
 	}
 
-	field, err := pickupPossibleField(tctx, meta, conn)
+	field, err := pickupPossibleField(tctx, conf, meta, conn)
 	if err != nil || field == "" {
 		// skip split chunk logic if not found proper field
 		tctx.L().Info("fallback to sequential dump due to no proper field. This won't influence the whole dump process",
@@ -766,11 +788,11 @@ func (d *Dumper) concurrentDumpTable(tctx *tcontext.Context, conn *BaseConn, met
 	chunkIndex := 0
 	nullValueCondition := ""
 	if conf.Where == "" {
-		nullValueCondition = fmt.Sprintf("`%s` IS NULL OR ", escapeString(field))
+		nullValueCondition = fmt.Sprintf("%s IS NULL OR ", escapeString(field))
 	}
 	for max.Cmp(cutoff) >= 0 {
 		nextCutOff := new(big.Int).Add(cutoff, bigEstimatedStep)
-		where := fmt.Sprintf("%s(`%s` >= %d AND `%s` < %d)", nullValueCondition, escapeString(field), cutoff, escapeString(field), nextCutOff)
+		where := fmt.Sprintf("%s(%s >= %d AND %s < %d)", nullValueCondition, escapeString(field), cutoff, escapeString(field), nextCutOff)
 		query := buildSelectQuery(db, tbl, selectField, "", buildWhereCondition(conf, where), orderByClause)
 		if len(nullValueCondition) > 0 {
 			nullValueCondition = ""
@@ -800,7 +822,7 @@ func (d *Dumper) sendTaskToChan(tctx *tcontext.Context, task Task, taskChan chan
 
 func (d *Dumper) selectMinAndMaxIntValue(tctx *tcontext.Context, conn *BaseConn, db, tbl, field string) (*big.Int, *big.Int, error) {
 	conf, zero := d.conf, &big.Int{}
-	query := fmt.Sprintf("SELECT MIN(`%s`),MAX(`%s`) FROM `%s`.`%s`",
+	query := fmt.Sprintf("SELECT MIN(%s),MAX(%s) FROM %s.%s",
 		escapeString(field), escapeString(field), escapeString(db), escapeString(tbl))
 	if conf.Where != "" {
 		query = fmt.Sprintf("%s WHERE %s", query, conf.Where)
@@ -1140,6 +1162,9 @@ func prepareTableListToDump(tctx *tcontext.Context, conf *Config, db *sql.Conn) 
 	} else {
 		listType = getListTableTypeByConf(conf)
 	}
+	if conf.ServerInfo.ServerType == version.ServerTypePostgreSQL {
+		listType = listTableByInfoSchemaPostgreSQL
+	}
 
 	conf.Tables, err = ListAllDatabasesTables(tctx, db, databases, listType, tableTypes...)
 	if err != nil {
@@ -1152,7 +1177,17 @@ func prepareTableListToDump(tctx *tcontext.Context, conf *Config, db *sql.Conn) 
 
 func dumpTableMeta(tctx *tcontext.Context, conf *Config, conn *BaseConn, db string, table *TableInfo) (TableMeta, error) {
 	tbl := table.Name
-	selectField, selectLen, err := buildSelectField(tctx, conn, db, tbl, conf.CompleteInsert)
+	var (
+		selectField    string
+		createTableSQL string
+		selectLen      int
+		err            error
+	)
+	if conf.ServerInfo.ServerType == version.ServerTypePostgreSQL {
+		selectField, selectLen, err = buildPostgresSelectField(tctx, conn, db, tbl, conf.CompleteInsert)
+	} else {
+		selectField, selectLen, err = buildSelectField(tctx, conn, db, tbl, conf.CompleteInsert)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1215,9 +1250,16 @@ func dumpTableMeta(tctx *tcontext.Context, conf *Config, conn *BaseConn, db stri
 		return meta, nil
 	}
 
-	createTableSQL, err := ShowCreateTable(tctx, conn, db, tbl)
-	if err != nil {
-		return nil, err
+	if conf.ServerInfo.ServerType == version.ServerTypePostgreSQL {
+		createTableSQL, err = ShowPostgresCreateTable(tctx, conn, db, tbl)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		createTableSQL, err = ShowCreateTable(tctx, conn, db, tbl)
+		if err != nil {
+			return nil, err
+		}
 	}
 	meta.showCreateTable = createTableSQL
 	return meta, nil
@@ -1322,6 +1364,17 @@ func startHTTPService(d *Dumper) error {
 // openSQLDB is an initialization step of Dumper.
 func openSQLDB(d *Dumper) error {
 	conf := d.conf
+	switch conf.SQLType {
+	case "", "mysql":
+		return openMySQLDB(d)
+	case "pg", "postgre", "postgresql":
+		return openPostgreDB(d)
+	}
+	return errors.Errorf("unknown SQLType %s", conf.SQLType)
+}
+
+func openMySQLDB(d *Dumper) error {
+	conf := d.conf
 	c, err := mysql.NewConnector(conf.GetDriverConfig(""))
 	if err != nil {
 		return errors.Trace(err)
@@ -1330,9 +1383,31 @@ func openSQLDB(d *Dumper) error {
 	return nil
 }
 
+func openPostgreDB(d *Dumper) error {
+	conf := d.conf
+	database := ""
+	if len(conf.Databases) > 0 {
+		database = conf.Databases[0]
+	}
+	db, err := sql.Open("postgres", conf.GetPostgreSQLDSN(database))
+	if err != nil {
+		return err
+	}
+	err = db.Ping()
+	if err != nil {
+		return err
+	}
+	d.dbHandle = db
+	return nil
+}
+
 // detectServerInfo is an initialization step of Dumper.
 func detectServerInfo(d *Dumper) error {
 	db, conf := d.dbHandle, d.conf
+	if conf.SQLType != "mysql" {
+		conf.ServerInfo.ServerType = version.ServerTypePostgreSQL
+		return nil
+	}
 	versionStr, err := version.FetchVersion(d.tctx.Context, db)
 	if err != nil {
 		conf.ServerInfo = ServerInfoUnknown
@@ -1502,6 +1577,9 @@ func updateServiceSafePoint(tctx *tcontext.Context, pdClient pd.Client, ttl int6
 // setSessionParam is an initialization step of Dumper.
 func setSessionParam(d *Dumper) error {
 	conf, pool := d.conf, d.dbHandle
+	if conf.SQLType != "mysql" {
+		return nil
+	}
 	si := conf.ServerInfo
 	consistency, snapshot := conf.Consistency, conf.Snapshot
 	sessionParam := conf.SessionParams
