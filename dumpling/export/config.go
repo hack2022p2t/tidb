@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/url"
 	"strconv"
 	"strings"
 	"text/template"
@@ -238,7 +239,7 @@ func (conf *Config) GetDriverConfig(db string) *mysql.Config {
 // GetPostgreSQLDSN returns the PostgreSQL driver config from Config.
 func (conf *Config) GetPostgreSQLDSN(database string) string {
 	hostPort := net.JoinHostPort(conf.Host, strconv.Itoa(conf.Port))
-	dsn := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", conf.User, conf.Password, hostPort, database)
+	dsn := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", url.PathEscape(conf.User), url.PathEscape(conf.Password), url.PathEscape(hostPort), database)
 	return dsn
 }
 
